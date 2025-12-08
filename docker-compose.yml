@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+
+  backend:
+    build: ./backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - STORAGE_MODE=local
+      - DEFAULT_PROVIDER=kie.ai
+      - DEFAULT_MODEL=veo-3.1-fast
+    depends_on:
+      - redis
+    volumes:
+      - ./storage:/app/storage
+
+  celery:
+    build: ./backend
+    restart: always
+    command: celery -A tasks.video_processor worker --loglevel=info
+    environment:
+      - REDIS_URL=redis://redis:6379
+      - STORAGE_MODE=local
+    depends_on:
+      - redis
+    volumes:
+      - ./storage:/app/storage
+
+  frontend:
+    build: ./frontend
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://147.93.58.111:8000/api/v1
+    depends_on:
+      - backend
+
+volumes:
+  redis_data:

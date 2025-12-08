@@ -68,3 +68,4 @@ dump.rdb
 # Logs
 *.log
 logs/
+backend/credentials/

@@ -1,0 +1,9 @@
+{
+  "name": "Video2Video",
+  "short_name": "V2V",
+  "description": "AI-Powered TikTok Product Video Clone Platform",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#0A0A0F",
+  "theme_color": "#0A0A0F"
+}

@@ -1,0 +1,5 @@
+{
+  "env": {
+    "NEXT_PUBLIC_API_URL": "http://147.93.58.111:8000/api/v1"
+  }
+}
