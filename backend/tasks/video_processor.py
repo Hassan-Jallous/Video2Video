@@ -1,7 +1,9 @@
 import asyncio
 import json
 import redis
+import traceback
 from typing import Optional
+from pathlib import Path
 from celery import Celery
 
 from config import settings
@@ -11,6 +13,8 @@ from services.gemini_analyzer import gemini_analyzer, TargetModel
 from services.video_generator import video_generator, Provider, Model
 from services.storage_manager import StorageManager
 from services.image_processor import image_processor
+from services.clip_segmenter import clip_segmenter
+from services.pipeline_logger import PipelineLogger
 
 # Initialize Celery
 celery_app = Celery(
@@ -86,10 +90,26 @@ def process_video_pipeline(
     5. Generate videos (N variants)
     6. Upload to storage
     """
+    # Initialize logger for this session
+    logger = PipelineLogger(session_id)
+
+    logger.pipeline_step("PIPELINE_START", "started", {
+        "session_id": session_id,
+        "tiktok_url": tiktok_url,
+        "product_name": product_name,
+        "product_image_path": product_image_path,
+        "product_image_exists": bool(product_image_path and Path(product_image_path).exists()),
+        "num_variants": num_variants,
+        "provider": provider,
+        "model": model,
+        "strategy": strategy,
+    })
+
     storage = StorageManager()
 
     try:
         # === Step 1: Download TikTok Video ===
+        logger.pipeline_step("DOWNLOAD", "started", {"url": tiktok_url})
         update_job_status(
             session_id,
             status="downloading",
@@ -100,6 +120,13 @@ def process_video_pipeline(
         download_result = video_downloader.download(tiktok_url, session_id)
         video_path = download_result["video_path"]
 
+        logger.pipeline_step("DOWNLOAD", "completed", {
+            "video_path": video_path,
+            "duration": download_result["duration"],
+            "video_exists": Path(video_path).exists(),
+            "video_size_bytes": Path(video_path).stat().st_size if Path(video_path).exists() else 0,
+        })
+
         update_job_status(
             session_id,
             status="downloading",
@@ -109,6 +136,7 @@ def process_video_pipeline(
         )
 
         # === Step 2: Scene Detection ===
+        logger.pipeline_step("SCENE_DETECTION", "started", {"video_path": video_path})
         update_job_status(
             session_id,
             status="analyzing",
@@ -118,6 +146,11 @@ def process_video_pipeline(
 
         scenes = scene_detector.detect_scenes(video_path, session_id)
 
+        logger.pipeline_step("SCENE_DETECTION", "completed", {
+            "scene_count": len(scenes),
+            "scenes": [{"start": s.start_time, "end": s.end_time} for s in scenes] if scenes else [],
+        })
+
         update_job_status(
             session_id,
             status="analyzing",
@@ -126,9 +159,8 @@ def process_video_pipeline(
             scene_count=len(scenes)
         )
 
-        # === Step 3: Gemini Analysis (Product-Focused) ===
+        # === Step 3: Calculate Clip Segments ===
         # Determine target model for prompt optimization
-        # Sora models -> SORA_2 prompts, Veo models -> VEO_3 prompts
         if "sora" in model.lower():
             target_model = TargetModel.SORA_2
             prompt_type = "Sora 2"
@@ -136,58 +168,127 @@ def process_video_pipeline(
             target_model = TargetModel.VEO_3
             prompt_type = "Veo 3.1"
 
+        logger.info("CLIP_SEGMENTER", f"Using target model: {target_model.value}, prompt_type: {prompt_type}", {
+            "target_model": target_model.value,
+            "prompt_type": prompt_type,
+            "model_input": model,
+        })
+
+        update_job_status(
+            session_id,
+            status="analyzing",
+            progress=32.0,
+            current_step="Calculating optimal clip segments..."
+        )
+
+        # Calculate clip segments based on video duration and model limits
+        video_duration = download_result["duration"]
+        clip_segments = clip_segmenter.calculate_segments(video_duration, model)
+
+        logger.info("CLIP_SEGMENTER", f"Calculated {len(clip_segments)} clip segments", {
+            "video_duration": video_duration,
+            "num_clips": len(clip_segments),
+            "clips": [
+                {
+                    "index": seg.clip_index,
+                    "start": seg.start_time,
+                    "end": seg.end_time,
+                    "duration": seg.duration,
+                    "target_duration": seg.target_duration,
+                    "pacing": seg.pacing,
+                }
+                for seg in clip_segments
+            ],
+        })
+
+        # Convert scene boundaries for clip alignment
+        scene_boundaries = [s.end_time for s in scenes[:-1]] if len(scenes) > 1 else []
+
         update_job_status(
             session_id,
             status="analyzing",
             progress=35.0,
-            current_step=f"Analyzing video for {product_name} ({prompt_type} prompts)..."
+            current_step=f"Video {video_duration:.1f}s -> {len(clip_segments)} clips"
         )
 
-        analysis = gemini_analyzer.analyze_video(
-            video_path,
-            product_name,
-            scenes,
-            target_model=target_model
-        )
+        # === Step 4: Gemini Analysis for Clips ===
+        logger.pipeline_step("GEMINI_ANALYSIS", "started", {
+            "product_name": product_name,
+            "num_clips": len(clip_segments),
+            "target_model": target_model.value,
+        })
 
         update_job_status(
             session_id,
             status="analyzing",
-            progress=50.0,
-            current_step="Video analysis complete"
+            progress=40.0,
+            current_step=f"Analyzing video for {product_name} ({prompt_type} prompts)..."
         )
 
-        # === Step 4: Extract Prompts from Analysis ===
-        # Gemini analyzer now returns VideoPromptResult with optimized prompts
+        # Convert clip_segments to dict format for Gemini
+        clip_segments_dict = [
+            {
+                "clip_index": seg.clip_index,
+                "start_time": seg.start_time,
+                "end_time": seg.end_time,
+                "duration": seg.duration,
+                "target_duration": seg.target_duration,
+                "pacing": seg.pacing,
+                "pacing_note": seg.pacing_note
+            }
+            for seg in clip_segments
+        ]
+
+        # Use clip-based analysis
+        analysis = gemini_analyzer.analyze_video_for_clips(
+            video_path,
+            product_name,
+            clip_segments_dict,
+            target_model=target_model
+        )
+
+        logger.pipeline_step("GEMINI_ANALYSIS", "completed", {
+            "num_prompts": len(analysis.clip_prompts or []),
+            "prompts_preview": [
+                {
+                    "clip_index": p.get("clip_index") if isinstance(p, dict) else getattr(p, "clip_index", 0),
+                    "prompt_preview": (p.get("prompt") if isinstance(p, dict) else getattr(p, "prompt", ""))[:150],
+                }
+                for p in (analysis.clip_prompts or [])
+            ],
+        })
+
         update_job_status(
             session_id,
             status="analyzing",
             progress=55.0,
-            current_step=f"Extracting {prompt_type} optimized prompts..."
+            current_step=f"Generated {len(analysis.clip_prompts or [])} {prompt_type} prompts"
         )
 
-        # Use scene_prompts for segments strategy, full_video_prompt for seamless
-        if strategy == "seamless" and analysis.full_video_prompt:
-            # Create a single prompt object for full video
-            from dataclasses import dataclass
-            @dataclass
-            class FullVideoPrompt:
-                scene_index: int = -1
-                duration: float = analysis.total_duration
-                prompt: str = analysis.full_video_prompt
-            prompts = [FullVideoPrompt()]
-        else:
-            # Use individual scene prompts
-            prompts = analysis.scene_prompts
+        # Get prompts from clip_prompts
+        prompts = analysis.clip_prompts or []
+
+        if not prompts:
+            logger.error("GEMINI_ANALYSIS", "No prompts generated!", data={
+                "analysis_result": str(analysis)[:500],
+            })
 
         update_job_status(
             session_id,
             status="analyzing",
             progress=60.0,
-            current_step=f"Generated {len(prompts)} {prompt_type} prompts"
+            current_step=f"Ready to generate {len(prompts)} clips per variant"
         )
 
         # === Step 5: Generate Videos (N Variants) ===
+        logger.pipeline_step("VIDEO_GENERATION", "started", {
+            "num_variants": num_variants,
+            "prompts_per_variant": len(prompts),
+            "total_generations": num_variants * len(prompts),
+            "provider": provider,
+            "model": model,
+        })
+
         provider_enum = Provider(provider)
         model_enum = Model(model)
 
@@ -196,50 +297,127 @@ def process_video_pipeline(
         all_variants = []
 
         for variant_idx in range(num_variants):
-            variant_clips = []
+            logger.info("VARIANT", f"Starting variant {variant_idx + 1}/{num_variants}", {
+                "variant_index": variant_idx,
+            })
 
-            for prompt_obj in prompts:
+            variant_clips = []
+            last_frame_path = None  # For chaining clips
+
+            for clip_prompt in prompts:
+                # Handle both dict and object formats
+                if isinstance(clip_prompt, dict):
+                    clip_index = clip_prompt.get("clip_index", 0)
+                    prompt_text = clip_prompt.get("prompt", "")
+                    target_duration = clip_prompt.get("target_duration", 15.0)
+                    clip_duration = clip_prompt.get("duration", target_duration)
+                else:
+                    clip_index = getattr(clip_prompt, "clip_index", 0)
+                    prompt_text = getattr(clip_prompt, "prompt", "")
+                    target_duration = getattr(clip_prompt, "target_duration", 15.0)
+                    clip_duration = getattr(clip_prompt, "duration", target_duration)
+
+                # Determine start frame for this clip
+                # Clip 0: use product_image, Clip 1+: use last frame from previous clip
+                start_frame = None
+                if clip_index > 0 and last_frame_path:
+                    start_frame = last_frame_path
+
+                logger.info("CLIP_GENERATION", f"Generating clip {clip_index + 1}/{len(prompts)}", {
+                    "variant_index": variant_idx,
+                    "clip_index": clip_index,
+                    "target_duration": target_duration,
+                    "has_start_frame": start_frame is not None,
+                    "start_frame_path": start_frame,
+                    "start_frame_exists": bool(start_frame and Path(start_frame).exists()),
+                    "using_product_image": clip_index == 0 and product_image_path is not None,
+                    "product_image_path": product_image_path if clip_index == 0 else None,
+                    "prompt_preview": prompt_text[:200],
+                })
+
                 update_job_status(
                     session_id,
                     status="generating",
                     progress=60.0 + (completed_generations / total_generations * 30.0),
                     current_step=f"Generating variant {variant_idx + 1}/{num_variants}, "
-                                 f"clip {len(variant_clips) + 1}/{len(prompts)}...",
+                                 f"clip {clip_index + 1}/{len(prompts)} ({target_duration:.0f}s)"
+                                 f"{' [chained]' if start_frame else ''}...",
                     variants_completed=variant_idx,
                     variants_total=num_variants
                 )
 
-                # Run async generation
+                # Run async generation with correct duration for model
                 result = asyncio.run(video_generator.generate(
-                    prompt=prompt_obj.prompt,
+                    prompt=prompt_text,
                     provider=provider_enum,
                     model=model_enum,
                     product_image_path=product_image_path,
-                    duration=min(prompt_obj.duration, 8.0),
+                    start_frame_path=start_frame,  # Chain from previous clip
+                    duration=target_duration,
                     session_id=session_id,
-                    variant_index=variant_idx * len(prompts) + prompt_obj.scene_index
+                    variant_index=variant_idx * len(prompts) + clip_index
                 ))
 
                 if result.success and result.video_path:
-                    # Upload to storage
-                    filename = f"variant_{variant_idx:02d}_clip_{prompt_obj.scene_index:02d}.mp4"
+                    logger.success("CLIP_GENERATION", f"Clip generated successfully: {result.video_path}", {
+                        "variant_index": variant_idx,
+                        "clip_index": clip_index,
+                        "video_path": result.video_path,
+                        "video_exists": Path(result.video_path).exists(),
+                        "video_size_bytes": Path(result.video_path).stat().st_size if Path(result.video_path).exists() else 0,
+                        "cost": result.cost_estimate,
+                    })
+
+                    # Extract last frame for next clip chaining
+                    try:
+                        logger.info("FRAME_CHAIN", f"Extracting last frame for clip chaining", {
+                            "source_video": result.video_path,
+                        })
+                        last_frame_path = image_processor.extract_last_frame(result.video_path, session_id=session_id)
+                        logger.success("FRAME_CHAIN", f"Last frame extracted: {last_frame_path}", {
+                            "frame_path": last_frame_path,
+                            "frame_exists": Path(last_frame_path).exists() if last_frame_path else False,
+                            "frame_size_bytes": Path(last_frame_path).stat().st_size if last_frame_path and Path(last_frame_path).exists() else 0,
+                        })
+                    except Exception as e:
+                        logger.error("FRAME_CHAIN", f"Failed to extract last frame", error=e)
+                        last_frame_path = None
+
+                    # Upload to storage with descriptive name: clip_1_of_3.mp4
+                    total_clips = len(prompts)
+                    filename = f"v{variant_idx + 1}_clip_{clip_index + 1}_of_{total_clips}.mp4"
                     stored = storage.upload_video(session_id, result.video_path, filename)
 
+                    logger.success("STORAGE", f"Video uploaded: {filename}", {
+                        "filename": filename,
+                        "url": stored.url,
+                    })
+
                     variant_clips.append({
-                        "clip_index": prompt_obj.scene_index,
-                        "scene_index": prompt_obj.scene_index,
-                        "duration": prompt_obj.duration,
-                        "prompt": prompt_obj.prompt,
+                        "clip_index": clip_index,
+                        "scene_index": clip_index,
+                        "duration": clip_duration,
+                        "target_duration": target_duration,
+                        "prompt": prompt_text,
                         "video_url": stored.url,
                         "status": "completed",
                         "cost": result.cost_estimate
                     })
                 else:
+                    logger.error("CLIP_GENERATION", f"Clip generation FAILED", data={
+                        "variant_index": variant_idx,
+                        "clip_index": clip_index,
+                        "error": result.error,
+                    })
+
+                    # Reset chaining if clip failed
+                    last_frame_path = None
                     variant_clips.append({
-                        "clip_index": prompt_obj.scene_index,
-                        "scene_index": prompt_obj.scene_index,
-                        "duration": prompt_obj.duration,
-                        "prompt": prompt_obj.prompt,
+                        "clip_index": clip_index,
+                        "scene_index": clip_index,
+                        "duration": clip_duration,
+                        "target_duration": target_duration,
+                        "prompt": prompt_text,
                         "video_url": None,
                         "status": "failed",
                         "error": result.error,
@@ -248,15 +426,42 @@ def process_video_pipeline(
 
                 completed_generations += 1
 
+            variant_status = "completed" if all(c["status"] == "completed" for c in variant_clips) else "partial"
+            variant_cost = sum(c.get("cost", 0) for c in variant_clips)
+
+            logger.info("VARIANT", f"Variant {variant_idx + 1} complete: {variant_status}", {
+                "variant_index": variant_idx,
+                "status": variant_status,
+                "clips_completed": sum(1 for c in variant_clips if c["status"] == "completed"),
+                "clips_failed": sum(1 for c in variant_clips if c["status"] == "failed"),
+                "total_cost": variant_cost,
+            })
+
             all_variants.append({
                 "variant_index": variant_idx,
                 "clips": variant_clips,
-                "status": "completed" if all(c["status"] == "completed" for c in variant_clips) else "partial",
-                "total_cost": sum(c.get("cost", 0) for c in variant_clips)
+                "status": variant_status,
+                "total_cost": variant_cost
             })
 
         # === Step 6: Finalize ===
         total_cost = sum(v["total_cost"] for v in all_variants)
+        total_completed = sum(1 for v in all_variants if v["status"] == "completed")
+
+        logger.pipeline_step("PIPELINE_COMPLETE", "completed", {
+            "total_variants": num_variants,
+            "completed_variants": total_completed,
+            "total_cost": total_cost,
+            "all_variants_summary": [
+                {
+                    "index": v["variant_index"],
+                    "status": v["status"],
+                    "cost": v["total_cost"],
+                    "clips_count": len(v["clips"]),
+                }
+                for v in all_variants
+            ],
+        })
 
         update_job_status(
             session_id,
@@ -280,6 +485,11 @@ def process_video_pipeline(
         }
 
     except Exception as e:
+        logger.critical("PIPELINE_ERROR", f"Pipeline FAILED with exception", error=e, data={
+            "session_id": session_id,
+            "traceback": traceback.format_exc(),
+        })
+
         update_job_status(
             session_id,
             status="failed",

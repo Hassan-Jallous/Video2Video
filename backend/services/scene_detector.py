@@ -52,7 +52,7 @@ class SceneDetector:
             from scenedetect import open_video
             video = open_video(video_path)
             duration = video.duration.get_seconds()
-            video.release()
+            del video  # VideoStreamCv2 doesn't have release(), just delete it
 
             # Extract single frame from middle
             frame_path = str(output_dir / "scene_001.jpg")

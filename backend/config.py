@@ -21,8 +21,8 @@ class Settings(BaseSettings):
 
     # Storage Strategy
     storage_mode: str = "local"  # "local" or "google_drive"
-    storage_path: str = "../storage"
-    temp_path: str = "../tmp"
+    storage_path: str = "/app/storage"
+    temp_path: str = "/app/tmp"
 
     # Defaults
     default_provider: str = "kie.ai"

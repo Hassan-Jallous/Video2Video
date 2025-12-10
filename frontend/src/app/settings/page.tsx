@@ -4,8 +4,7 @@ import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Card from "@/components/ui/Card";
 import Button from "@/components/ui/Button";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+import { getApiBase } from "@/lib/api";
 
 type KeyStatus = "untested" | "validating" | "valid" | "invalid";
 
@@ -51,7 +50,7 @@ export default function SettingsPage() {
 
   const loadSettings = async () => {
     try {
-      const response = await fetch(`${API_BASE}/settings`);
+      const response = await fetch(`${getApiBase()}/settings`);
       if (response.ok) {
         const data = await response.json();
         // Update key status indicators
@@ -100,7 +99,7 @@ export default function SettingsPage() {
     setter((prev) => ({ ...prev, status: "validating", message: "Validating..." }));
 
     try {
-      const response = await fetch(`${API_BASE}/settings/validate-key`, {
+      const response = await fetch(`${getApiBase()}/settings/validate-key`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ key_type: keyType, key_value: keyValue }),
@@ -128,7 +127,7 @@ export default function SettingsPage() {
     if (defapiKey.value) updates.defapi_key = defapiKey.value;
 
     try {
-      const response = await fetch(`${API_BASE}/settings/keys`, {
+      const response = await fetch(`${getApiBase()}/settings/keys`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updates),
@@ -136,10 +135,16 @@ export default function SettingsPage() {
 
       if (response.ok) {
         setKeysChanged(false);
-        // Clear the input values after saving (for security)
-        setGeminiKey((prev) => ({ ...prev, value: "" }));
-        setKieAiKey((prev) => ({ ...prev, value: "" }));
-        setDefapiKey((prev) => ({ ...prev, value: "" }));
+        // Clear input values and update status to show keys are saved
+        if (geminiKey.value) {
+          setGeminiKey({ value: "", status: "valid", message: "Key is set" });
+        }
+        if (kieAiKey.value) {
+          setKieAiKey({ value: "", status: "valid", message: "Key is set" });
+        }
+        if (defapiKey.value) {
+          setDefapiKey({ value: "", status: "valid", message: "Key is set" });
+        }
       }
     } catch (error) {
       console.error("Failed to save keys:", error);
@@ -155,7 +160,7 @@ export default function SettingsPage() {
     }
 
     try {
-      const response = await fetch(`${API_BASE}/settings/prompts`, {
+      const response = await fetch(`${getApiBase()}/settings/prompts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(updates),
@@ -175,7 +180,7 @@ export default function SettingsPage() {
 
   const resetPrompts = async () => {
     try {
-      const response = await fetch(`${API_BASE}/settings/prompts/reset`, {
+      const response = await fetch(`${getApiBase()}/settings/prompts/reset`, {
         method: "POST",
       });
 

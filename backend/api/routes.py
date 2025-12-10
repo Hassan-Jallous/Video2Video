@@ -31,19 +31,20 @@ from models.schemas import (
 from services.storage_manager import StorageManager
 from services.image_processor import image_processor
 from tasks.video_processor import process_video_pipeline, get_session_data, update_job_status
+from services.pipeline_logger import PipelineLogger
 
 router = APIRouter()
 
 # Redis client
 redis_client = redis.from_url(settings.redis_url)
 
-# Cost map for estimates
+# Cost map for estimates (per request)
 COST_PER_8S = {
     (Provider.KIE_AI, Model.VEO_31_FAST): 0.40,
     (Provider.KIE_AI, Model.VEO_31_QUALITY): 2.00,
     (Provider.KIE_AI, Model.SORA_2): 0.15,
-    (Provider.KIE_AI, Model.SORA_2_PRO): 0.50,
-    (Provider.DEFAPI, Model.DEFAPI_VEO_31): 0.10,
+    (Provider.DEFAPI, Model.DEFAPI_VEO_31): 0.50,  # $0.5 per request
+    (Provider.DEFAPI, Model.DEFAPI_SORA_2): 0.10,  # $0.1 per request
 }
 
 
@@ -97,6 +98,19 @@ async def create_session(request: CreateSessionRequest):
     )
 
 
+def transform_video_urls(variants: list, session_id: str) -> list:
+    """Transform Google Drive URLs to proxy URLs"""
+    if not variants:
+        return variants
+    for variant in variants:
+        for clip in variant.get("clips", []):
+            video_url = clip.get("video_url", "")
+            if video_url and video_url.startswith("https://drive.google.com"):
+                filename = f"variant_{str(clip.get('clip_index', 0)).zfill(3)}.mp4"
+                clip["video_url"] = f"/api/v1/videos/{session_id}/{filename}"
+    return variants
+
+
 @router.get("/sessions/{session_id}", response_model=SessionResponse)
 async def get_session(session_id: str):
     """Get session details"""
@@ -104,6 +118,12 @@ async def get_session(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
 
     data = get_session_data(session_id)
+
+    # Transform Google Drive URLs to proxy URLs
+    variants = data.get("variants", [])
+    if isinstance(variants, str):
+        variants = json.loads(variants)
+    variants = transform_video_urls(variants, session_id)
 
     return SessionResponse(
         session_id=session_id,
@@ -119,7 +139,7 @@ async def get_session(session_id: str):
         original_video_url=data.get("original_video_url"),
         product_image_url=data.get("product_image_url"),
         scene_count=int(data.get("scene_count", 0)),
-        variants=data.get("variants", []),
+        variants=variants,
         total_cost=float(data.get("total_cost", 0.0)),
         error_message=data.get("error"),
     )
@@ -279,11 +299,18 @@ async def get_video_library(
             for variant in variants:
                 for clip in variant.get("clips", []):
                     if clip.get("video_url"):
+                        # Transform Google Drive URLs to proxy URLs
+                        video_url = clip["video_url"]
+                        if video_url.startswith("https://drive.google.com"):
+                            # Convert to proxy URL
+                            filename = f"variant_{str(clip['clip_index']).zfill(3)}.mp4"
+                            video_url = f"/api/v1/videos/{sid}/{filename}"
+
                         all_videos.append(VideoLibraryItem(
                             session_id=sid,
                             variant_index=variant["variant_index"],
                             clip_index=clip["clip_index"],
-                            video_url=clip["video_url"],
+                            video_url=video_url,
                             product_name=data.get("product_name", ""),
                             created_at=datetime.fromisoformat(data.get("created_at", datetime.utcnow().isoformat())),
                             duration=clip.get("duration", 0.0),
@@ -340,6 +367,50 @@ async def get_api_status():
         "default_provider": settings.default_provider,
         "default_model": settings.default_model
     }
+
+
+# === Video Streaming ===
+
+@router.get("/videos/{session_id}/{filename}")
+async def stream_video(session_id: str, filename: str, download: bool = False):
+    """Stream video file - supports local storage and Google Drive proxy"""
+    from fastapi.responses import FileResponse, StreamingResponse, Response
+    from pathlib import Path
+
+    # Headers for download mode
+    headers = {}
+    if download:
+        headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+
+    # Try local storage first
+    video_path = Path(settings.storage_path) / session_id / filename
+    if video_path.exists():
+        return FileResponse(
+            video_path,
+            media_type="video/mp4",
+            headers=headers if download else None,
+            filename=filename if download else None
+        )
+
+    # Proxy from Google Drive if not found locally
+    if settings.storage_mode == "google_drive" and settings.google_drive_folder_id:
+        try:
+            storage = StorageManager(storage_mode="google_drive")
+            video_bytes = storage.download_video(session_id, filename)
+            return Response(
+                content=video_bytes,
+                media_type="video/mp4",
+                headers={
+                    "Content-Length": str(len(video_bytes)),
+                    **({"Content-Disposition": f'attachment; filename="{filename}"'} if download else {})
+                }
+            )
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
+
+    raise HTTPException(status_code=404, detail="Video not found")
 
 
 # === Settings ===
@@ -521,46 +592,36 @@ async def validate_api_key(request: ValidateKeyRequest):
             )
 
         elif key_type == KeyType.KIE_AI:
-            # Test Kie.ai API
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    "https://api.kie.ai/api/user/balance",
-                    headers={"Authorization": f"Bearer {key_value}"},
-                    timeout=10.0
+            # Kie.ai doesn't have a public balance endpoint
+            # Just validate the key format (should be a reasonable length)
+            if len(key_value) >= 20:
+                return ValidateKeyResponse(
+                    key_type=key_type,
+                    is_valid=True,
+                    message="Kie.ai API key format is valid"
                 )
-                if response.status_code == 200:
-                    return ValidateKeyResponse(
-                        key_type=key_type,
-                        is_valid=True,
-                        message="Kie.ai API key is valid"
-                    )
-                else:
-                    return ValidateKeyResponse(
-                        key_type=key_type,
-                        is_valid=False,
-                        message=f"Kie.ai API returned status {response.status_code}"
-                    )
+            else:
+                return ValidateKeyResponse(
+                    key_type=key_type,
+                    is_valid=False,
+                    message="Kie.ai API key seems too short"
+                )
 
         elif key_type == KeyType.DEFAPI:
-            # Test defapi.org API
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    "https://api.defapi.org/api/v1/user/balance",
-                    headers={"Authorization": f"Bearer {key_value}"},
-                    timeout=10.0
+            # defapi.org doesn't have a public balance endpoint
+            # Just validate the key format (should be a reasonable length)
+            if len(key_value) >= 20:
+                return ValidateKeyResponse(
+                    key_type=key_type,
+                    is_valid=True,
+                    message="defapi.org API key format is valid"
                 )
-                if response.status_code == 200:
-                    return ValidateKeyResponse(
-                        key_type=key_type,
-                        is_valid=True,
-                        message="defapi.org API key is valid"
-                    )
-                else:
-                    return ValidateKeyResponse(
-                        key_type=key_type,
-                        is_valid=False,
-                        message=f"defapi.org API returned status {response.status_code}"
-                    )
+            else:
+                return ValidateKeyResponse(
+                    key_type=key_type,
+                    is_valid=False,
+                    message="defapi.org API key seems too short"
+                )
 
     except Exception as e:
         return ValidateKeyResponse(
@@ -599,3 +660,49 @@ async def reset_prompt_templates():
         "veo_3_prompt": DEFAULT_VEO_3_PROMPT,
     })
     return {"message": "Prompts reset to defaults"}
+
+
+# === Pipeline Logs ===
+
+@router.get("/sessions/{session_id}/logs")
+async def get_session_logs(session_id: str, limit: int = 100):
+    """Get pipeline logs for a session"""
+    if not redis_client.exists(f"session:{session_id}"):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    logger = PipelineLogger(session_id)
+    logs = logger.get_logs(limit=limit)
+
+    return {
+        "session_id": session_id,
+        "logs": logs,
+        "total": len(logs),
+    }
+
+
+@router.get("/sessions/{session_id}/logs/errors")
+async def get_session_errors(session_id: str):
+    """Get only error logs for a session"""
+    if not redis_client.exists(f"session:{session_id}"):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    logger = PipelineLogger(session_id)
+    errors = logger.get_errors()
+
+    return {
+        "session_id": session_id,
+        "errors": errors,
+        "total": len(errors),
+    }
+
+
+@router.get("/sessions/{session_id}/logs/summary")
+async def get_session_log_summary(session_id: str):
+    """Get summary of session logs"""
+    if not redis_client.exists(f"session:{session_id}"):
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    logger = PipelineLogger(session_id)
+    summary = logger.get_summary()
+
+    return summary

@@ -5,8 +5,7 @@ import Card from "@/components/ui/Card";
 import ProgressBar from "@/components/ui/ProgressBar";
 import StatRow from "@/components/ui/StatRow";
 import Link from "next/link";
-
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000/api/v1";
+import { getApiBase } from "@/lib/api";
 
 interface Session {
   session_id: string;
@@ -39,7 +38,7 @@ export default function Dashboard() {
   const fetchData = async () => {
     try {
       // Fetch sessions
-      const sessionsRes = await fetch(`${API_BASE}/sessions`);
+      const sessionsRes = await fetch(`${getApiBase()}/sessions`);
       if (sessionsRes.ok) {
         const data = await sessionsRes.json();
         setSessions(data.sessions || []);

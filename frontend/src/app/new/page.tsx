@@ -7,12 +7,14 @@ import Button from "@/components/ui/Button";
 import Input from "@/components/ui/Input";
 import Select from "@/components/ui/Select";
 import ImageUpload from "@/components/ui/ImageUpload";
+import { getApiBase } from "@/lib/api";
 
 const providerOptions = [
+  { value: "defapi.org|defapi-sora-2", label: "Sora 2", sublabel: "$0.10/15s" },
   { value: "kie.ai|veo-3.1-fast", label: "Kie.ai Veo 3.1 Fast", sublabel: "$0.40/8s" },
   { value: "kie.ai|veo-3.1-quality", label: "Kie.ai Veo 3.1 Quality", sublabel: "$2.00/8s" },
   { value: "kie.ai|sora-2", label: "Kie.ai Sora 2", sublabel: "$0.15/8s" },
-  { value: "defapi.org|defapi-veo-3.1", label: "defapi.org Veo 3.1", sublabel: "$0.10/8s" },
+  { value: "defapi.org|defapi-veo-3.1", label: "defapi.org Veo 3.1", sublabel: "$0.50/8s" },
 ];
 
 const strategyOptions = [
@@ -36,7 +38,7 @@ export default function NewSessionPage() {
   const [tiktokUrl, setTiktokUrl] = useState("");
   const [productName, setProductName] = useState("");
   const [productImage, setProductImage] = useState<File | null>(null);
-  const [providerModel, setProviderModel] = useState("kie.ai|veo-3.1-fast");
+  const [providerModel, setProviderModel] = useState("defapi.org|defapi-sora-2");
   const [strategy, setStrategy] = useState("segments");
   const [numVariants, setNumVariants] = useState("1");
 
@@ -58,7 +60,7 @@ export default function NewSessionPage() {
       const [provider, model] = providerModel.split("|");
 
       // Create session
-      const response = await fetch("http://localhost:8000/api/v1/sessions", {
+      const response = await fetch(`${getApiBase()}/sessions`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -80,14 +82,14 @@ export default function NewSessionPage() {
         const formData = new FormData();
         formData.append("file", productImage);
 
-        await fetch(`http://localhost:8000/api/v1/sessions/${session.session_id}/image`, {
+        await fetch(`${getApiBase()}/sessions/${session.session_id}/image`, {
           method: "POST",
           body: formData,
         });
       }
 
       // Start generation
-      await fetch(`http://localhost:8000/api/v1/sessions/${session.session_id}/generate`, {
+      await fetch(`${getApiBase()}/sessions/${session.session_id}/generate`, {
         method: "POST",
       });
 

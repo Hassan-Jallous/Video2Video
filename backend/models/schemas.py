@@ -15,8 +15,8 @@ class Model(str, Enum):
     VEO_31_FAST = "veo-3.1-fast"
     VEO_31_QUALITY = "veo-3.1-quality"
     SORA_2 = "sora-2"
-    SORA_2_PRO = "sora-2-pro"
     DEFAPI_VEO_31 = "defapi-veo-3.1"
+    DEFAPI_SORA_2 = "defapi-sora-2"
 
 
 class Strategy(str, Enum):
@@ -30,6 +30,7 @@ class JobStatus(str, Enum):
     ANALYZING = "analyzing"
     GENERATING = "generating"
     COMPLETED = "completed"
+    PARTIAL = "partial"  # Some clips succeeded, some failed
     FAILED = "failed"
 
 

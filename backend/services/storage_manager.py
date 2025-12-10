@@ -80,7 +80,7 @@ class LocalStorageStrategy(StorageStrategy):
         return StoredVideo(
             session_id=session_id,
             filename=filename,
-            url=str(dest_path),
+            url=f"/videos/{session_id}/{filename}",
             size_bytes=dest_path.stat().st_size,
             storage_type="local"
         )
@@ -93,8 +93,8 @@ class LocalStorageStrategy(StorageStrategy):
         return file_path.read_bytes()
 
     def get_video_url(self, session_id: str, filename: str) -> str:
-        """Return local file path as URL"""
-        return str(self._get_session_path(session_id) / filename)
+        """Return API URL for video streaming"""
+        return f"/videos/{session_id}/{filename}"
 
     def list_session_videos(self, session_id: str) -> List[StoredVideo]:
         """List all videos in session folder"""
@@ -104,7 +104,7 @@ class LocalStorageStrategy(StorageStrategy):
             videos.append(StoredVideo(
                 session_id=session_id,
                 filename=file_path.name,
-                url=str(file_path),
+                url=f"/videos/{session_id}/{file_path.name}",
                 size_bytes=file_path.stat().st_size,
                 storage_type="local"
             ))
@@ -128,7 +128,7 @@ class LocalStorageStrategy(StorageStrategy):
 
 
 class GoogleDriveStorageStrategy(StorageStrategy):
-    """Google Drive storage for production"""
+    """Google Drive storage for production - flat structure (no subfolders)"""
 
     def __init__(self, folder_id: str, service_account_file: str):
         self.folder_id = folder_id
@@ -149,64 +149,44 @@ class GoogleDriveStorageStrategy(StorageStrategy):
             self._service = build("drive", "v3", credentials=credentials)
         return self._service
 
-    def _get_or_create_session_folder(self, session_id: str) -> str:
-        """Get or create a subfolder for the session"""
-        # Search for existing folder
-        query = (
-            f"name='{session_id}' and "
-            f"'{self.folder_id}' in parents and "
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"trashed=false"
-        )
-        results = self.service.files().list(q=query, fields="files(id)").execute()
-        files = results.get("files", [])
-
-        if files:
-            return files[0]["id"]
-
-        # Create new folder
-        folder_metadata = {
-            "name": session_id,
-            "mimeType": "application/vnd.google-apps.folder",
-            "parents": [self.folder_id]
-        }
-        folder = self.service.files().create(
-            body=folder_metadata,
-            fields="id"
-        ).execute()
-        return folder["id"]
+    def _get_full_filename(self, session_id: str, filename: str) -> str:
+        """Get full filename with session prefix (flat structure)"""
+        return f"{session_id}_{filename}"
 
     def upload_video(self, session_id: str, file_path: str, filename: str) -> StoredVideo:
-        """Upload video to Google Drive session folder"""
+        """Upload video directly to main folder (no subfolders)"""
         from googleapiclient.http import MediaFileUpload
 
         source = Path(file_path)
         if not source.exists():
             raise FileNotFoundError(f"Source file not found: {file_path}")
 
-        # Get/create session folder
-        session_folder_id = self._get_or_create_session_folder(session_id)
+        # Use flat structure: session_id_filename.mp4
+        full_filename = self._get_full_filename(session_id, filename)
 
-        # Upload file
+        # Upload file directly to main folder
         file_metadata = {
-            "name": filename,
-            "parents": [session_folder_id]
+            "name": full_filename,
+            "parents": [self.folder_id]
         }
         media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
         file = self.service.files().create(
             body=file_metadata,
             media_body=media,
-            fields="id,size"
+            fields="id,size",
+            supportsAllDrives=True  # Required for Shared Drives
         ).execute()
 
         # Make file publicly accessible via link
         self.service.permissions().create(
             fileId=file["id"],
-            body={"type": "anyone", "role": "reader"}
+            body={"type": "anyone", "role": "reader"},
+            supportsAllDrives=True  # Required for Shared Drives
         ).execute()
 
-        # Get shareable link
-        video_url = f"https://drive.google.com/uc?id={file['id']}&export=download"
+        # Return proxy URL instead of direct Google Drive URL
+        # (Google Drive URLs don't work as <video src> due to CORS)
+        video_url = f"/api/v1/videos/{session_id}/{filename}"
 
         return StoredVideo(
             session_id=session_id,
@@ -217,18 +197,23 @@ class GoogleDriveStorageStrategy(StorageStrategy):
         )
 
     def download_video(self, session_id: str, filename: str) -> bytes:
-        """Download video from Google Drive"""
+        """Download video from Google Drive (flat structure)"""
         from googleapiclient.http import MediaIoBaseDownload
         import io
 
-        # Find file
-        session_folder_id = self._get_or_create_session_folder(session_id)
-        query = f"name='{filename}' and '{session_folder_id}' in parents and trashed=false"
-        results = self.service.files().list(q=query, fields="files(id)").execute()
+        # Find file with session prefix
+        full_filename = self._get_full_filename(session_id, filename)
+        query = f"name='{full_filename}' and '{self.folder_id}' in parents and trashed=false"
+        results = self.service.files().list(
+            q=query,
+            fields="files(id)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
         files = results.get("files", [])
 
         if not files:
-            raise FileNotFoundError(f"Video not found: {filename}")
+            raise FileNotFoundError(f"Video not found: {full_filename}")
 
         file_id = files[0]["id"]
 
@@ -244,32 +229,41 @@ class GoogleDriveStorageStrategy(StorageStrategy):
         return buffer.getvalue()
 
     def get_video_url(self, session_id: str, filename: str) -> str:
-        """Get shareable Google Drive URL"""
-        session_folder_id = self._get_or_create_session_folder(session_id)
-        query = f"name='{filename}' and '{session_folder_id}' in parents and trashed=false"
-        results = self.service.files().list(q=query, fields="files(id)").execute()
+        """Get shareable Google Drive URL (flat structure)"""
+        full_filename = self._get_full_filename(session_id, filename)
+        query = f"name='{full_filename}' and '{self.folder_id}' in parents and trashed=false"
+        results = self.service.files().list(
+            q=query,
+            fields="files(id)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
         files = results.get("files", [])
 
         if not files:
-            raise FileNotFoundError(f"Video not found: {filename}")
+            raise FileNotFoundError(f"Video not found: {full_filename}")
 
         file_id = files[0]["id"]
         return f"https://drive.google.com/uc?id={file_id}&export=download"
 
     def list_session_videos(self, session_id: str) -> List[StoredVideo]:
-        """List all videos in session folder"""
-        session_folder_id = self._get_or_create_session_folder(session_id)
-        query = f"'{session_folder_id}' in parents and mimeType='video/mp4' and trashed=false"
+        """List all videos for a session (flat structure with prefix search)"""
+        # Search for files starting with session_id
+        query = f"name contains '{session_id}_' and '{self.folder_id}' in parents and mimeType='video/mp4' and trashed=false"
         results = self.service.files().list(
             q=query,
-            fields="files(id,name,size)"
+            fields="files(id,name,size)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
         ).execute()
 
         videos = []
         for file in results.get("files", []):
+            # Extract original filename (remove session_id_ prefix)
+            original_filename = file["name"].replace(f"{session_id}_", "", 1)
             videos.append(StoredVideo(
                 session_id=session_id,
-                filename=file["name"],
+                filename=original_filename,
                 url=f"https://drive.google.com/uc?id={file['id']}&export=download",
                 size_bytes=int(file.get("size", 0)),
                 storage_type="google_drive"
@@ -277,30 +271,37 @@ class GoogleDriveStorageStrategy(StorageStrategy):
         return videos
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete session folder from Google Drive"""
-        query = (
-            f"name='{session_id}' and "
-            f"'{self.folder_id}' in parents and "
-            f"mimeType='application/vnd.google-apps.folder' and "
-            f"trashed=false"
-        )
-        results = self.service.files().list(q=query, fields="files(id)").execute()
+        """Delete all videos for a session (flat structure)"""
+        # Search for files starting with session_id
+        query = f"name contains '{session_id}_' and '{self.folder_id}' in parents and trashed=false"
+        results = self.service.files().list(
+            q=query,
+            fields="files(id)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
         files = results.get("files", [])
 
-        if files:
-            self.service.files().delete(fileId=files[0]["id"]).execute()
-            return True
-        return False
+        deleted = False
+        for file in files:
+            self.service.files().delete(fileId=file["id"], supportsAllDrives=True).execute()
+            deleted = True
+        return deleted
 
     def delete_video(self, session_id: str, filename: str) -> bool:
-        """Delete specific video from Google Drive"""
-        session_folder_id = self._get_or_create_session_folder(session_id)
-        query = f"name='{filename}' and '{session_folder_id}' in parents and trashed=false"
-        results = self.service.files().list(q=query, fields="files(id)").execute()
+        """Delete specific video from Google Drive (flat structure)"""
+        full_filename = self._get_full_filename(session_id, filename)
+        query = f"name='{full_filename}' and '{self.folder_id}' in parents and trashed=false"
+        results = self.service.files().list(
+            q=query,
+            fields="files(id)",
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True
+        ).execute()
         files = results.get("files", [])
 
         if files:
-            self.service.files().delete(fileId=files[0]["id"]).execute()
+            self.service.files().delete(fileId=files[0]["id"], supportsAllDrives=True).execute()
             return True
         return False
 
